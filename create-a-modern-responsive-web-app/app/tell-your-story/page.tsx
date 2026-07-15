@@ -47,8 +47,12 @@ export default function TellYourStoryPage() {
     setGenerating(true); setError("");
     try {
       const response = await fetch("/.netlify/functions/generate-story", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ story, purpose: need }) });
-      const data = await response.json();
+      const responseText = await response.text();
+      let data;
+      try { data = JSON.parse(responseText); }
+      catch { throw new Error("Bridge is temporarily unavailable. Please try again."); }
       if (!response.ok) throw new Error(data.error || "Something went wrong.");
+      if (!data.versions) throw new Error("Bridge returned an incomplete response. Please try again.");
       // Result text stays on this device until Supabase storage is added.
       window.localStorage.setItem("bridge-original-story", story);
       window.localStorage.setItem("bridge-ai-versions", JSON.stringify(data.versions));

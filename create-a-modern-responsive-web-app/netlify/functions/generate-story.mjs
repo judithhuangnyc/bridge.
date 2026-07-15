@@ -1,12 +1,15 @@
 /**
- * Server-only Gemini proxy. GEMINI_API_KEY is read by Netlify at runtime and
- * is never returned to, bundled with, or otherwise exposed to the browser.
+ * Server-only AI proxy. Provider credentials are read by Netlify at runtime
+ * and are never returned to, bundled with, or exposed to the browser.
  */
 export default async (request) => {
-  if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+  if (request.method !== "POST") return Response.json({ error: "Method not allowed." }, { status: 405 });
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return Response.json({ error: "Bridge AI is not configured yet." }, { status: 503 });
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const openAiApiKey = process.env.OPENAI_API_KEY;
+  if (!geminiApiKey && !openAiApiKey) return Response.json({ error: "Bridge AI is not configured yet." }, { status: 503 });
+  const geminiBaseUrl = (process.env.GOOGLE_GEMINI_BASE_URL || "https://generativelanguage.googleapis.com").replace(/\/+$/, "");
+  const openAiBaseUrl = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
 
   try {
     const { story, purpose } = await request.json();
@@ -22,23 +25,72 @@ Return valid JSON only, with exactly these keys: clear, ngo, professional. Each 
 USER STORY:
 ${story.trim()}`;
 
-    const geminiResponse = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.2, responseMimeType: "application/json" },
-      }),
-    });
-    if (!geminiResponse.ok) {
-      console.error("Gemini error", geminiResponse.status, await geminiResponse.text());
-      return Response.json({ error: "Bridge could not create a version right now. Please try again." }, { status: 502 });
+    const hasVersions = (versions) => ["clear", "ngo", "professional"].every((key) => typeof versions?.[key] === "string");
+
+    const requestGeminiVersions = async (model) => {
+      if (!geminiApiKey) return { status: 0 };
+      try {
+        const geminiResponse = await fetch(`${geminiBaseUrl}/v1beta/models/${model}:generateContent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": geminiApiKey },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.2, responseMimeType: "application/json" },
+          }),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!geminiResponse.ok) {
+          console.error("Gemini error", model, geminiResponse.status);
+          return { status: geminiResponse.status };
+        }
+        const geminiData = JSON.parse(await geminiResponse.text());
+        const text = geminiData.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("");
+        const parsedVersions = JSON.parse(text);
+        if (!hasVersions(parsedVersions)) throw new Error("Unexpected Gemini response format");
+        return { status: geminiResponse.status, versions: parsedVersions };
+      } catch (error) {
+        console.error("Gemini model failed", model, error);
+        return { status: 0 };
+      }
+    };
+
+    const requestOpenAiVersions = async () => {
+      if (!openAiApiKey) return { status: 0 };
+      try {
+        const openAiResponse = await fetch(`${openAiBaseUrl}/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${openAiApiKey}` },
+          body: JSON.stringify({
+            model: "gpt-4o-mini",
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.2,
+            response_format: { type: "json_object" },
+          }),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!openAiResponse.ok) {
+          console.error("OpenAI fallback error", openAiResponse.status);
+          return { status: openAiResponse.status };
+        }
+        const openAiData = JSON.parse(await openAiResponse.text());
+        const parsedVersions = JSON.parse(openAiData.choices?.[0]?.message?.content || "");
+        if (!hasVersions(parsedVersions)) throw new Error("Unexpected OpenAI response format");
+        return { status: openAiResponse.status, versions: parsedVersions };
+      } catch (error) {
+        console.error("OpenAI fallback failed", error);
+        return { status: 0 };
+      }
+    };
+
+    let result = await requestGeminiVersions("gemini-2.5-flash");
+    if (result.status === 503) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      result = await requestGeminiVersions("gemini-2.5-flash");
     }
-    const geminiData = await geminiResponse.json();
-    const text = geminiData.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("");
-    const versions = JSON.parse(text);
-    if (!["clear", "ngo", "professional"].every((key) => typeof versions[key] === "string")) throw new Error("Unexpected Gemini response format");
-    return Response.json({ versions });
+
+    if (!result.versions) result = await requestOpenAiVersions();
+    if (!result.versions) return Response.json({ error: "Bridge could not create a version right now. Please try again." }, { status: 502 });
+    return Response.json({ versions: result.versions });
   } catch (error) {
     console.error("Story generation failed", error);
     return Response.json({ error: "Bridge could not understand that response. Please try again." }, { status: 500 });
